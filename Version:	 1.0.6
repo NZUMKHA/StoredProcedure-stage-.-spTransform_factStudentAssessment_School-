@@ -1,0 +1,1675 @@
+USE [KCDW]
+GO
+/****** Object:  StoredProcedure [stage].[spTransform_factStudentAssessment_School]    Script Date: 21/10/2025 10:16:03 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+ALTER PROCEDURE [stage].[spTransform_factStudentAssessment_School] @DETL_ProcessLogID INT, @DETL_PackageLogID INT, @DETL_DataFlowLogID INT, @DETL_LastTouchedBY VARCHAR(100)
+
+AS
+
+/**********************************************************************************************************************
+
+Author:		 Tim Foote
+Date:		 29/04/2017
+Version:	 1.0
+Description: This proc does a load from extract to transform, applying some business logic.
+
+Test extract:
+exec stage.[spTransform_factStudentAssessment_School] 1,1,1,'Test' 
+select * from [stage].[Transform_factStudentAssessment_School]
+
+
+Changes: 
+Author:		 m.kannangara
+Date:		 09/03/2018
+Version:	 1.0.1
+Modifications: Include additional AssessAreaHdgAbbrev2 in the validation
+
+Changes: 
+Author:		 m.kannangara
+Date:		 14/03/2018
+Version:	 1.0.2
+Modifications: Insert TotalStudents into Transform_factStudentAssessment_School table
+
+Changes: 
+Author:		 m.kannangara
+Date:		 22/03/2018
+Version:	 1.0.3
+Modifications: Added validation in AssessResultsResult
+
+Changes: 
+Author:		 m.kannangara
+Date:		 04/07/2018
+Version:	 1.0.4
+Modifications: Included all classes with assessments/marks by excluding the AssessableFlag 
+			   Added validation to extract A&E and CIE Eqv grades based on the control flags
+
+Changes: 
+Author:		 m.kannangara
+Date:		 23/08/2018
+Version:	 1.0.5
+Modifications: Added Low A&E and CIE grade flags to identify students with respective low grades
+
+Changes: 
+Author:		 m.kannangara
+Date:		 27/08/2018
+Version:	 1.0.6
+Modifications: Added Assessment Seq to identify the assessment number.
+
+Changes: 
+Author:		 u.khattak
+Date:		 21/10/2025
+Version:	 1.0.7
+Modifications: Added T4 Senior CIE and A&E flag support (T4.SEN.CIE.EQ, T4.SEN.A&E)
+
+
+***********************************************************************************************************************/
+
+
+SET NOCOUNT ON
+
+DECLARE @ErrorMsg VARCHAR(MAX),
+		@CurrentSchoolCode VARCHAR(15),
+		@DETL_ValidFromDateTime INT,
+		@DETL_LoadDateTime DATETIME,
+		@MaxFileYear INT
+
+DECLARE @T1JunAEFlag BIT, @T2JunAEFlag BIT, @T3JunAEFlag BIT, @T4JunAEFlag BIT
+DECLARE @T1SenAEFlag BIT, @T1SenCIEFlag BIT, @T2SenAEFlag BIT, @T2SenCIEFlag BIT, @T3SenAEFlag BIT, @T3SenCIEFlag BIT, @T4SenAEFlag BIT, @T4SenCIEFlag BIT
+DECLARE @RepComFlag BIT
+
+
+DECLARE @T1JunAECode VARCHAR(15) = 'T1.JUN.A&E', @T2JunAECode VARCHAR(15) = 'T2.JUN.A&E', @T3JunAECode VARCHAR(15) = 'T3.JUN.A&E', @T4JunAECode VARCHAR(15) = 'T4.JUN.A&E'
+DECLARE @T1SenAECode VARCHAR(15) = 'T1.SEN.A&E',@T1SenCIECode VARCHAR(15) = 'T1.SEN.CIE.EQ', @T2SenAECode VARCHAR(15) = 'T2.SEN.A&E', @T2SenCIECode VARCHAR(15) = 'T2.SEN.CIE.EQ', @T3SenAECode VARCHAR(15) = 'T3.SEN.A&E', @T3SenCIECode VARCHAR(15) = 'T3.SEN.CIE.EQ', @T4SenAECode VARCHAR(15) = 'T4.SEN.A&E', @T4SenCIECode VARCHAR(15) = 'T4.SEN.CIE.EQ'
+   
+SELECT @T1JunAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T1JunAECode
+SELECT @T2JunAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T2JunAECode
+SELECT @T3JunAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T3JunAECode
+SELECT @T4JunAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T4JunAECode
+
+SELECT @T1SenAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T1SenAECode
+SELECT @T1SenCIEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T1SenCIECode
+SELECT @T2SenAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T2SenAECode
+SELECT @T2SenCIEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T2SenCIECode
+SELECT @T3SenAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T3SenAECode
+SELECT @T3SenCIEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T3SenCIECode
+SELECT @T4SenAEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T4SenAECode
+SELECT @T4SenCIEFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = @T4SenCIECode
+
+SELECT @RepComFlag = LockedFlag FROM [stage].[Extract_Synergetic_luDashboardDataControl] WHERE Code = 'REP.COM'
+
+
+
+
+
+
+ BEGIN TRY
+
+	--		Constant
+
+	SET		@DETL_LoadDateTime = GETDATE()
+
+
+
+
+CREATE TABLE #tableNCEAKey (FileType varchar(5), FileYear int, FileSemester int, ResultGroup varchar(25), GroupClass varchar(25), StudentID int, NCEAKey varchar(1), Classcode varchar(25)) 
+CREATE TABLE #tableNCEAKeyCount (FileType varchar(5), FileYear int, FileSemester int, ResultGroup varchar(25), GroupClass varchar(25), ResultExcellence int, ResultMerit int, ResultAchieved int, ResultNotAchieved int, Classcode varchar(25), EH int, EM int, EL int, MH int, MM int, ML int, AH int, AM int, AL int, NH int, NM int, NL int) 
+CREATE TABLE #tableNCEAGrades (FileType varchar(5), FileYear int, FileSemester int, ResultGroup varchar(25), GroupClass varchar(25), Classcode varchar(25), EH int, EM int, EL int, MH int, MM int, ML int, AH int, AM int, AL int, NH int, NM int, NL int) 
+CREATE TABLE #tableMinMaxCount_Temp (FileType varchar(5), FileYear int, FileSemester int, ResultGroup varchar(25), GroupClass varchar(25), Result varchar(5))
+CREATE TABLE #tableMinMaxCount (FileType varchar(5), FileYear int, FileSemester int, ResultGroup varchar(25), GroupClass varchar(25), MaxResult int, MinResult int)
+CREATE TABLE #tableTotalStudents (FileType varchar(5), FileYear int, FileSemester int, ResultGroup varchar(25), GroupClass varchar(25), TotalStudents int) 
+CREATE TABLE #tableStudentsWith_AELowGrades (FileType varchar(5), FileYear int, FileSemester int, StudentID int, ResultGroup varchar(25)) -- Added by m.kannangara on 23-Aug-2018
+CREATE TABLE #tableStudentsWith_CIELowGrades (FileType varchar(5), FileYear int, FileSemester int, StudentID int, ResultGroup varchar(25)) -- Added by m.kannangara on 23-Aug-2018 
+CREATE TABLE #tableStudentAssessmentSeq (FileType varchar(5), FileYear int, FileSemester int, StudentID int, Classcode varchar(25), ResultGroup varchar(25), SeqNo int) -- Added by m.kannangara on 27-Aug-2018 
+CREATE TABLE #tableStudentExamSeq (FileType varchar(5), FileYear int, FileSemester int, StudentID int, Classcode varchar(25), ResultGroup varchar(25), SeqNo int) -- Added by m.kannangara on 23-Aug-2018 
+
+
+
+	--Insert Comments
+
+	SELECT DISTINCT FileYear, FileSemester, StudentID, ClassCode, AssessmentComment
+	INTO #AssessmentComment
+	FROM stage.Transform_factStudentAssessment_School
+
+
+	INSERT INTO #tableMinMaxCount_Temp
+	SELECT      scrg.FileType, 
+				scrg.FileYear, 
+				scrg.FileSemester, 
+				scrg.ResultGroup, 
+				scrg.GroupClass, 
+				ROUND(REPLACE(REPLACE(REPLACE(srsr.AssessResultsResult ,'*',''),'(',''),')',''),0) AS Result 
+				--REPLACE(REPLACE(REPLACE(srsr.AssessResultsResult ,'*',''),'(',''),')','') AS MinResult
+
+					
+
+	FROM        stage.Extract_Synergetic_SubjectClassResultGroups AS scrg INNER JOIN
+				stage.Extract_Synergetic_vStudentReportsSemesterResults AS srsr ON scrg.FileType = srsr.FileType AND 
+				scrg.FileYear = srsr.FileYear AND scrg.FileSemester = srsr.FileSemester AND scrg.ClassCode = srsr.ClassCode AND scrg.ResultGroup = srsr.AssessAreaResultGroup
+	
+	WHERE		--srsr.AssessableFlag = 1 and 
+				srsr.AssessAreaResultType = 'OGRaw' and srsr.AssessResultsResultDate IS NOT NULL AND ISNUMERIC(srsr.AssessResultsResult) = 1 AND
+				scrg.FileYear >= 2018 
+	
+	--GROUP BY	scrg.FileType, scrg.FileYear, scrg.FileSemester, scrg.ResultGroup , scrg.GroupClass
+
+
+
+
+	 
+	INSERT INTO #tableMinMaxCount
+	SELECT      FileType, 
+				FileYear, 
+				FileSemester, 
+				ResultGroup, 
+				GroupClass, 
+				MAX(CONVERT(DECIMAL(8,2), Result)) AS MaxResult, 
+				MIN(CONVERT(DECIMAL(8,2), Result)) AS MinResult
+
+					
+
+	FROM        #tableMinMaxCount_Temp
+	
+	GROUP BY	FileType, FileYear, FileSemester, ResultGroup , GroupClass
+
+
+
+
+
+		
+	;WITH	cte_TotalStudents
+	AS(
+	SELECT      scrg.FileType, 
+				scrg.FileYear, 
+				scrg.FileSemester, 
+				scrg.ResultGroup, 
+				scrg.GroupClass, 
+				COUNT(srsr.StudentID) AS TotalStudents
+	
+	FROM        stage.Extract_Synergetic_SubjectClassResultGroups AS scrg INNER JOIN
+				stage.Extract_Synergetic_vStudentReportsSemesterResults AS srsr ON scrg.FileType = srsr.FileType AND 
+				scrg.FileYear = srsr.FileYear AND scrg.FileSemester = srsr.FileSemester AND scrg.ClassCode = srsr.ClassCode AND 
+				scrg.ResultGroup = srsr.AssessAreaResultGroup
+
+	WHERE		srsr.AssessResultsResult NOT IN ('','ABS','NA','N/A','AC','abs', 'DNS')
+				
+	GROUP BY	scrg.FileType, scrg.FileYear, scrg.FileSemester, scrg.ResultGroup, scrg.GroupClass
+
+
+	UNION
+
+	SELECT      scrg.FileType, 
+				scrg.FileYear, 
+				scrg.FileSemester, 
+				scrg.ResultGroup, 
+				scrg.GroupClass, 
+				COUNT(srsr.StudentID) AS TotalStudents
+	
+	FROM        stage.Extract_Synergetic_SubjectClassResultGroups AS scrg INNER JOIN
+				stage.Extract_Synergetic_vPastStudentReportsSemesterResults AS srsr ON scrg.FileType = srsr.FileType AND 
+				scrg.FileYear = srsr.FileYear AND scrg.FileSemester = srsr.FileSemester AND scrg.ClassCode = srsr.ClassCode AND 
+				scrg.ResultGroup = srsr.AssessAreaResultGroup
+
+	WHERE		srsr.AssessResultsResult NOT IN ('','ABS','NA','N/A','AC','abs', 'DNS')
+				
+	GROUP BY	scrg.FileType, scrg.FileYear, scrg.FileSemester, scrg.ResultGroup, scrg.GroupClass
+
+	)
+
+	INSERT INTO #tableTotalStudents
+
+	SELECT FileType, FileYear, FileSemester, ResultGroup, GroupClass, SUM(TotalStudents) AS TotalStudents
+	FROM cte_TotalStudents
+	GROUP BY FileType, FileYear, FileSemester, ResultGroup, GroupClass
+
+
+	--		Clear stage table
+
+	TRUNCATE TABLE stage.Transform_factStudentAssessment_School
+
+	--		Constant variable
+		
+	SELECT  @CurrentSchoolCode = NCEASchoolCode 
+	FROM	DDS.dimSchool
+	WHERE	--SchoolName = 'Kings College'
+			NCEASchoolCode = '89' -- (Kings College (Otahuhu))
+
+
+
+
+	INSERT INTO #tableNCEAKey
+	SELECT			scrg.FileType, 
+					scrg.FileYear, 
+					scrg.FileSemester, 
+					scrg.ResultGroup, 
+					scrg.GroupClass,
+					sca.studentID,
+					case when sca.AssessResultsResult like 'E%' then 'E' when sca.AssessResultsResult like 'M%' then 'M' 
+					when sca.AssessResultsResult like 'A%' then 'A'
+					when sca.AssessResultsResult like 'N%' then 'N' end AS NCEAKey
+					,sca.ClassCode
+
+	FROM			stage.Extract_Synergetic_SubjectClassResultGroups AS scrg INNER JOIN
+					stage.Extract_Synergetic_vStudentReportsSemesterResults AS sca ON scrg.FileType = sca.FileType AND 
+					scrg.FileYear = sca.FileYear AND scrg.FileSemester = sca.FileSemester AND scrg.ClassCode = sca.ClassCode AND
+					scrg.ResultGroup = sca.AssessAreaResultGroup
+	
+	WHERE 
+					--sca.AssessableFlag = 1 AND 
+					sca.AssessResultsResultDate is not null and scrg.ResultGroup not like '%A&E%'
+					and AssessResultsResult NOT IN ('N/A', 'abs', 'AC', 'ABSENT', 'DNS', 'NA') and scrg.FileYear >= 2018
+
+	GROUP BY		scrg.FileType, scrg.FileYear, scrg.FileSemester, scrg.ResultGroup , scrg.GroupClass, sca.studentID, sca.AssessResultsResult,sca.ClassCode
+
+	UNION
+
+	SELECT			scrg.FileType, 
+					scrg.FileYear, 
+					scrg.FileSemester, 
+					scrg.ResultGroup, 
+					scrg.GroupClass,
+					sca.studentID,
+					case when sca.AssessResultsResult like 'E%' then 'E' when sca.AssessResultsResult like 'M%' then 'M' 
+					when sca.AssessResultsResult like 'A%' then 'A'
+					when sca.AssessResultsResult like 'N%' then 'N' end AS NCEAKey
+					,sca.ClassCode
+
+	FROM			stage.Extract_Synergetic_SubjectClassResultGroups AS scrg INNER JOIN
+					stage.Extract_Synergetic_vPastStudentReportsSemesterResults AS sca ON scrg.FileType = sca.FileType AND 
+					scrg.FileYear = sca.FileYear AND scrg.FileSemester = sca.FileSemester AND scrg.ClassCode = sca.ClassCode AND
+					scrg.ResultGroup = sca.AssessAreaResultGroup
+	
+	WHERE 
+					--sca.AssessableFlag = 1 AND 
+					sca.AssessResultsResultDate is not null and scrg.ResultGroup not like '%A&E%'
+					and AssessResultsResult NOT IN ('N/A', 'abs', 'AC', 'ABSENT', 'DNS', 'NA') and scrg.FileYear >= 2018
+
+	GROUP BY		scrg.FileType, scrg.FileYear, scrg.FileSemester, scrg.ResultGroup , scrg.GroupClass, sca.studentID, sca.AssessResultsResult,sca.ClassCode
+
+
+
+
+	INSERT INTO #tableNCEAKeyCount (FileType, FileYear, FileSemester, ResultGroup, GroupClass, Classcode)
+
+	SELECT DISTINCT
+	FileType, 
+	FileYear, 
+	FileSemester, 
+	ResultGroup,
+	GroupClass,
+	Classcode 
+	
+	FROM  #tableNCEAKey
+
+
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.ResultExcellence = (select COUNT (NCEAKey) FROM #tableNCEAKey nceak
+	WHERE  #tableNCEAKeyCount.FileType = nceak.FileType 
+	and #tableNCEAKeyCount.FileYear = nceak.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceak.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceak.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceak.GroupClass 
+	and NCEAKey = 'E')
+
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.ResultMerit = (select COUNT (NCEAKey) FROM #tableNCEAKey nceak
+	WHERE  #tableNCEAKeyCount.FileType = nceak.FileType 
+	and #tableNCEAKeyCount.FileYear = nceak.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceak.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceak.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceak.GroupClass
+	and NCEAKey = 'M')
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.ResultAchieved = (select COUNT (NCEAKey) FROM #tableNCEAKey nceak
+	WHERE  #tableNCEAKeyCount.FileType = nceak.FileType 
+	and #tableNCEAKeyCount.FileYear = nceak.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceak.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceak.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceak.GroupClass
+	and NCEAKey = 'A')
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.ResultNotAchieved = (select COUNT (NCEAKey) FROM #tableNCEAKey nceak
+	WHERE  #tableNCEAKeyCount.FileType = nceak.FileType 
+	and #tableNCEAKeyCount.FileYear = nceak.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceak.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceak.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceak.GroupClass
+	and NCEAKey = 'N')
+
+
+
+	
+
+	INSERT INTO #tableNCEAGrades (FileType,  FileYear, FileSemester, ResultGroup, GroupClass, ClassCode, EH, EM, EL, MH, MM, ML, AH, AM, AL, NH, NM, NL) 
+
+	
+	select 
+	FileType, 
+	FileYear, 
+	FileSemester, 
+	
+	ResultGroup, 
+	GroupClass,
+	Classcode,
+	
+	convert(int,(((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)))
+
+	+
+
+			(((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultExcellence)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))) 
+	-
+	
+	((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))))/6)*5))) AS 'E(H)',
+
+
+		convert(int,(((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)))
+
+	+
+
+			(((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultExcellence)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))) 
+	-
+	
+	((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))))/6)*3))) AS 'E(M)',
+
+
+		convert(int,(((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)))
+
+	+
+
+			(((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultExcellence)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))) 
+	-
+	
+	((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))))/6)*1))) AS 'E(L)',
+
+
+	convert(int,(((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))) 
+	
+	+
+		
+		(((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)))
+	-
+	((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))))/ 6)*5))) AS 'M(H)',
+
+
+
+	convert(int,(((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))) 
+	
+	+
+		
+		(((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)))
+	-
+	((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))))/ 6)*3))) AS 'M(M)',
+
+
+	convert(int,(((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))) 
+	
+	+
+		
+		(((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) +	(convert(decimal(8,2),(convert(decimal(8,4),ResultMerit)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)))
+	-
+	((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))))/ 6)*1))) AS 'M(L)',
+
+
+
+
+
+
+		convert(int,(convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)
+	+
+	
+		((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))
+
+	-
+
+			convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))/6)*5))) AS 'A(H)',
+
+
+
+	
+		convert(int,(convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)
+	+
+	
+		((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))
+
+	-
+
+			convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))/6)*3))) AS 'A(M)',
+
+
+
+			convert(int,(convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)
+	+
+	
+		((((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100)) + (convert(decimal(8,2),(convert(decimal(8,4),ResultAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))
+
+	-
+
+			convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))/6)*1))) AS 'A(L)',
+
+
+
+	convert(int,((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))/6)*5) AS 'N(H)',
+	
+	
+	convert(int,((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))/6)*3) AS 'N(M)',  
+
+
+	convert(int,((convert(decimal(8,2),(convert(decimal(8,4),ResultNotAchieved)/
+	SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved))*100))/6)*1) AS 'N(L)' 
+
+
+	FROM #tableNCEAKeyCount
+	--where GroupClass like '%.N.%'
+	GROUP BY 
+	FileType, 
+	FileYear, 
+	FileSemester, 
+	Classcode,
+	ResultGroup, 
+	GroupClass,
+	ResultExcellence,
+	ResultMerit,
+	ResultAchieved,
+	ResultNotAchieved
+
+	HAVING (SUM(ResultExcellence+
+	ResultMerit+
+	ResultAchieved+
+	ResultNotAchieved) > 0)
+
+	
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.EH = (select EH FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.EM = (select EM FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.EL = (select EL FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.MH = (select MH FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.MM = (select MM FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.ML = (select ML FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.AH = (select AH FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.AM = (select AM FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.AL = (select AL FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.NH = (select NH FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.NM = (select NM FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+	
+	UPDATE #tableNCEAKeyCount
+	SET #tableNCEAKeyCount.NL = (select NL FROM #tableNCEAGrades nceag
+	WHERE  #tableNCEAKeyCount.FileType = nceag.FileType 
+	and #tableNCEAKeyCount.FileYear = nceag.FileYear
+	and #tableNCEAKeyCount.FileSemester = nceag.FileSemester
+	and #tableNCEAKeyCount.ResultGroup  = nceag.ResultGroup 
+	and #tableNCEAKeyCount.GroupClass  = nceag.GroupClass
+	and #tableNCEAKeyCount.Classcode  = nceag.Classcode
+	)
+
+		
+	 /*
+	INSERT INTO #tableMinMaxCount
+	SELECT      scrg.FileType, 
+				scrg.FileYear, 
+				scrg.FileSemester, 
+				scrg.ResultGroup, 
+				scrg.GroupClass, 
+				MAX(CONVERT(DECIMAL(8,2), REPLACE(srsr.AssessResultsResult ,'*',''))) AS MaxResult, 
+				MIN(CONVERT(DECIMAL(8,2),REPLACE(srsr.AssessResultsResult,'*',''))) AS MinResult
+
+					
+
+	FROM        stage.Extract_Synergetic_SubjectClassResultGroups AS scrg INNER JOIN
+				stage.Extract_Synergetic_vStudentReportsSemesterResults AS srsr ON scrg.FileType = srsr.FileType AND 
+				scrg.FileYear = srsr.FileYear AND scrg.FileSemester = srsr.FileSemester AND scrg.ClassCode = srsr.ClassCode AND scrg.ResultGroup = srsr.AssessAreaResultGroup
+	
+	WHERE		--srsr.AssessableFlag = 1 and 
+				srsr.AssessAreaResultType = 'OGRaw' and srsr.AssessResultsResultDate IS NOT NULL AND AssessResultsResult NOT IN ('N/A', 'abs', 'AC', 'ABSENT') AND 
+				scrg.FileYear >= 2018 and srsr.AssessResultsResult like '%[0-9]%'
+	
+	GROUP BY	scrg.FileType, scrg.FileYear, scrg.FileSemester, scrg.ResultGroup , scrg.GroupClass
+	*/
+
+
+	
+
+	
+	/* Added by m.kannangara on 23-Aug-2018 */
+	INSERT INTO #tableStudentsWith_AELowGrades
+
+		SELECT			srsr.FileType, 
+						srsr.FileYear, 
+						srsr.FileSemester, 
+						srsr.StudentID,
+						srsr.AssessAreaResultGroup
+				
+	
+		FROM        stage.Extract_Synergetic_vStudentReportsSemesterResults srsr
+
+		WHERE		(srsr.AssessAreaResultGroup LIKE '%ORD.A&E' AND srsr.AssessResultsResult IN ('D', 'E'))
+
+		
+
+		UNION
+
+
+		SELECT			srsr.FileType, 
+						srsr.FileYear, 
+						srsr.FileSemester, 
+						srsr.StudentID,
+						srsr.AssessAreaResultGroup
+				
+	
+		FROM        stage.Extract_Synergetic_vPastStudentReportsSemesterResults srsr
+
+		WHERE		(srsr.AssessAreaResultGroup LIKE '%ORD.A&E' AND srsr.AssessResultsResult IN ('D', 'E'))
+
+		ORDER BY  	srsr.AssessAreaResultGroup	
+
+
+		--/* Added by m.kannangara on 23-Aug-2018 */
+		--INSERT INTO #tableStudentsWith_CIELowGrades
+
+		--/*SELECT			srsr.FileType, 
+		--				srsr.FileYear, 
+		--				srsr.FileSemester, 
+		--				srsr.StudentID,
+		--				srsr.AssessAreaResultGroup
+				
+	
+		--FROM        stage.Extract_Synergetic_vStudentReportsSemesterResults srsr
+		
+
+		--WHERE		(srsr.AssessAreaResultGroup LIKE '%.SEN.ORD' AND srsr.AssessResultsResult IN ('C', 'D', 'E', 'F', 'G', 'U')) 
+		--			--OR 
+		--			--(srsr.AssessAreaResultGroup LIKE '%.SEN.ORD.%' AND srsr.AssessResultsResult IN ('A(H)', 'A(M)', 'A(L)', 'N(H)', 'N(M)', 'N(L)')) 
+		--			--OR 
+		--			--(srsr.AssessAreaResultGroup LIKE '%.NCEA.INT.%' AND srsr.AssessResultsResult IN ('A', 'N')) 
+
+		--ORDER BY  	srsr.AssessAreaResultGroup	
+		--*/
+
+
+		--	SELECT			srsr.FileType, 
+		--				srsr.FileYear, 
+		--				srsr.FileSemester, 
+		--				srsr.StudentID,
+		--				(substring(srsr.AssessAreaResultGroup,1,2)) AssessAreaResultGroup
+		--			--,AssessResultsResult
+		--			--,ClassCode
+		--			----, case when vdnceacg.GradeCode is null then vdnceag.GradeCode else  vdnceacg.GradeCode end
+		--			--, 
+		--			--AVG(case when vdnceacg.GradeValue is not null then vdnceacg.GradeValue
+		--			--when vdnceag.GradeValue is not null then vdnceag.GradeValue 
+		--			--when vdcieg.GradeValue is not null then vdcieg.GradeValue end)
+	
+		--FROM        stage.Extract_Synergetic_vStudentReportsSemesterResults srsr
+		--			LEFT JOIN DDS.vDimNCEACollegeGrade vdnceacg ON srsr.AssessResultsResult = vdnceacg.GradeCode  
+		--			LEFT JOIN DDS.vDimNCEAGrade vdnceag ON srsr.AssessResultsResult = vdnceag.GradeCode
+		--			LEFT JOIN [DDS].[vDimCIEGrade] vdcieg ON srsr.AssessResultsResult = vdcieg.GradeCode
+					  
+		
+
+		--WHERE	
+
+		
+		--	((srsr.AssessAreaResultGroup LIKE '%.SEN.ORD' AND srsr.AssessResultsResult IN ('C', 'D', 'E', 'F', 'G', 'U')) 
+		--			OR 
+		--			(srsr.AssessAreaResultGroup LIKE '%.SEN.ORD.%' AND srsr.AssessResultsResult IN ('A(H)', 'A(M)', 'A(L)', 'N(H)', 'N(M)', 'N(L)')) 
+		--			OR 
+		--			(srsr.AssessAreaResultGroup LIKE '%.NCEA.INT.%' AND srsr.AssessResultsResult IN ('A', 'N')) 
+		--			)
+
+
+		--			--and
+					
+		--			--ID in ( 380619,381630)  and fileyear = 2018 --and classcode = '12.MES.Na'
+
+		--group by srsr.FileType, 
+		--					srsr.FileYear, 
+		--					srsr.FileSemester, 
+		--					srsr.StudentID,
+		--					(substring(srsr.AssessAreaResultGroup,1,2)),
+		--				--,AssessResultsResult,
+		--				ClassCode
+
+		--having (AVG(case when vdnceacg.GradeValue is not null then vdnceacg.GradeValue
+		--				when vdnceag.GradeValue is not null then vdnceag.GradeValue 
+		--				when vdcieg.GradeValue is not null then vdcieg.GradeValue end) < 60)
+
+
+
+		
+		INSERT INTO #tableStudentAssessmentSeq
+		SELECT		srsr.FileType, 
+						srsr.FileYear, 
+						srsr.FileSemester, 
+						srsr.StudentID,
+						srsr.ClassCode,
+						srsr.AssessAreaResultGroup,
+						--DENSE_RANK() OVER (PARTITION BY StudentID ORDER BY srsr.AssessAreaResultGroup ASC )	AS SeqNo
+						ROW_NUMBER() OVER(PARTITION BY srsr.FileYear, srsr.StudentID, srsr.classcode ORDER BY srsr.FileYear, srsr.classcode, srsr.AssessAreaResultGroup ASC) AS SeqNo
+		FROM        stage.Extract_Synergetic_vStudentReportsSemesterResults srsr
+
+		WHERE		(srsr.AssessAreaResultGroup LIKE '%.SEN.ORD%' OR srsr.AssessAreaResultGroup LIKE '%.JUN.ORD%') and (srsr.AssessAreaResultGroup NOT LIKE '%.EXAM%' AND srsr.AssessAreaResultGroup NOT LIKE '%.SEN.ORD' AND srsr.AssessAreaResultGroup NOT LIKE '%ORD.A&E') AND srsr.AssessResultsResult <> ''
+	
+		UNION
+
+		SELECT		srsr.FileType, 
+						srsr.FileYear, 
+						srsr.FileSemester, 
+						srsr.StudentID,
+						srsr.ClassCode,
+						srsr.AssessAreaResultGroup,
+						--DENSE_RANK() OVER (PARTITION BY StudentID ORDER BY srsr.AssessAreaResultGroup ASC )	AS SeqNo
+						ROW_NUMBER() OVER(PARTITION BY srsr.FileYear, srsr.StudentID, srsr.classcode ORDER BY srsr.FileYear, srsr.classcode, srsr.AssessAreaResultGroup ASC) AS SeqNo
+		FROM        stage.Extract_Synergetic_vPastStudentReportsSemesterResults srsr
+
+		WHERE		(srsr.AssessAreaResultGroup LIKE '%.SEN.ORD%' OR srsr.AssessAreaResultGroup LIKE '%.JUN.ORD%') and (srsr.AssessAreaResultGroup NOT LIKE '%.EXAM%' AND srsr.AssessAreaResultGroup NOT LIKE '%.SEN.ORD' AND srsr.AssessAreaResultGroup NOT LIKE '%ORD.A&E') AND srsr.AssessResultsResult <> ''
+	
+
+
+
+		INSERT INTO #tableStudentExamSeq
+		SELECT		srsr.FileType, 
+						srsr.FileYear, 
+						srsr.FileSemester, 
+						srsr.StudentID,
+						srsr.ClassCode,
+						srsr.AssessAreaResultGroup,
+						--DENSE_RANK() OVER (PARTITION BY StudentID ORDER BY srsr.AssessAreaResultGroup ASC )	AS SeqNo
+						ROW_NUMBER() OVER(PARTITION BY srsr.FileYear, srsr.StudentID, srsr.classcode ORDER BY srsr.FileYear, srsr.classcode, srsr.AssessAreaResultGroup ASC) AS SeqNo
+
+		FROM        stage.Extract_Synergetic_vStudentReportsSemesterResults srsr
+
+		WHERE	srsr.AssessAreaResultGroup LIKE '%.EXAM%' AND srsr.AssessResultsResult <> ''
+
+		UNION
+
+		SELECT		srsr.FileType, 
+						srsr.FileYear, 
+						srsr.FileSemester, 
+						srsr.StudentID,
+						srsr.ClassCode,
+						srsr.AssessAreaResultGroup,
+						--DENSE_RANK() OVER (PARTITION BY StudentID ORDER BY srsr.AssessAreaResultGroup ASC )	AS SeqNo
+						ROW_NUMBER() OVER(PARTITION BY srsr.FileYear, srsr.StudentID, srsr.classcode ORDER BY srsr.FileYear, srsr.classcode, srsr.AssessAreaResultGroup ASC) AS SeqNo
+
+		FROM        stage.Extract_Synergetic_vPastStudentReportsSemesterResults srsr
+
+		WHERE	srsr.AssessAreaResultGroup LIKE '%.EXAM%' AND srsr.AssessResultsResult <> ''
+
+
+			
+
+
+
+	--		Final Result
+
+	INSERT  INTO stage.Transform_factStudentAssessment_School ( FileType, FileYear, FileSemester, StudentID, ClassColumn, ClassCampus, ClassCode, ClassComment, ClassLearningAreaCode, ClassLearningAreaDescription,
+																AssessmentCode, AssessHeading, AssessUnitName, AssessOverview, AssessAreaResultType, AssessAreaResultTypeShortDesc, AssessAreaResultTypeSort,
+																AssessAreaResultGroup, AssessAreaResultGroupDescription, AssessAreaResultGroupLockedFlag, AssessAreaMarkOutOf, AssessAreaWeightingFactor,
+																AssessAreaMaskCode, AssessAreaHdgAbbrev1, AssessAreaHdgAbbrev2, AssessAreaHeading, AssessAreaOverview, AssessAreaResultEntryFlag,
+																AssessAreaResultPrintFlag, AssessAreaDefaultClassification, AssessResultsResult, AssessResultsResultDate, AssessResultsTopicComment,
+																AssessResultsClassification, AssessResultClassificationDescription, AssessCommentsCommentType, AssessCommentsStaffID,
+																StudentForm, StudentTutor, House, BoardingHouse, AssessmentComment, StaffID, AssessAreaResultTypeSynergyMeaning,
+																SubjectComment, AssessResultGroupDescription, MentorID, ResultValue, TotalStudents, MaxResult, MinResult, ResultExcellence, ResultMerit, ResultAchieved, 
+																ResultNotAchieved, GroupClass, NCEAMark--, LowerQuartile, Median, UpperQuartile
+																,LowAEGrade, LowCIEGrade -- Added by m.kannangara on 23-Aug-2018
+																,AssessmentSeq -- Added by m.kannangara on 27-Aug-2018 
+																,AssessAreaSeq -- Added by m.kannangara on 27-Sep-2018 
+																,ClassDescription -- Added by m.kannangara on 21-Jan-2020 
+																,OriginalAssessResultsResult -- Added by m.kannangara on 10-Jul-2023 
+																) 
+	SELECT  r.FileType, r.FileYear, r.FileSemester, r.ID AS StudentID, ClassColumn, r.ClassCampus, r.ClassCode,
+			AssessCommentsComment AS ClassComment, ClassLearningAreaCode, ClassLearningAreaDescription,
+			AssessmentCode, AssessHeading, AssessUnitName, AssessOverview, AssessAreaResultType,
+			AssessAreaResultTypeShortDesc, AssessAreaResultTypeSort, AssessAreaResultGroup,
+			AssessAreaResultGroupDescription, AssessAreaResultGroupLockedFlag, AssessAreaMarkOutOf,
+			AssessAreaWeightingFactor, AssessAreaMaskCode, AssessAreaHdgAbbrev1, AssessAreaHdgAbbrev2,
+			AssessAreaHeading, AssessAreaOverview, AssessAreaResultEntryFlag, AssessAreaResultPrintFlag,
+			AssessAreaDefaultClassification, 
+			--AssessResultsResult = CASE WHEN (AssessAreaHdgAbbrev2 IN ('A&E Grade', 'CIE Eqv Gr') AND (r.DataVerificationFlag = 0)) THEN '' ELSE AssessResultsResult END --Added by m.kannangara on 22.03.2018
+			
+			--AssessResultsResult
+
+			AssessResultsResult = 
+			CASE
+			WHEN (AssessAreaResultGroup = 'T1.JUN.ORD.A&E' AND @T1JunAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T1.JUN.ORD.A&E' AND @T1JunAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T2.JUN.ORD.A&E' AND @T2JunAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T2.JUN.ORD.A&E' AND @T2JunAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T3.JUN.ORD.A&E' AND @T3JunAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T3.JUN.ORD.A&E' AND @T3JunAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T4.JUN.ORD.A&E' AND @T4JunAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T4.JUN.ORD.A&E' AND @T4JunAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T1.SEN.ORD.A&E' AND @T1SenAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T1.SEN.ORD.A&E' AND @T1SenAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T1.SEN.ORD' AND @T1SenCIEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T1.SEN.ORD' AND @T1SenCIEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T2.SEN.ORD.A&E' AND @T2SenAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T2.SEN.ORD.A&E' AND @T2SenAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T2.SEN.ORD' AND @T2SenCIEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T2.SEN.ORD' AND @T2SenCIEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T3.SEN.ORD.A&E' AND @T3SenAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+			--WHEN (AssessAreaResultGroup = 'T3.SEN.ORD.A&E' AND @T3SenAEFlag = 0) THEN AssessResultsResult
+			WHEN (AssessAreaResultGroup = 'T3.SEN.ORD' AND @T3SenCIEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+      --WHEN (AssessAreaResultGroup = 'T3.SEN.ORD' AND @T3SenCIEFlag = 0) THEN AssessResultsResult
+      WHEN (AssessAreaResultGroup = 'T4.SEN.ORD.A&E' AND @T4SenAEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+      WHEN (AssessAreaResultGroup = 'T4.SEN.ORD' AND @T4SenCIEFlag = 1 AND r.FileYear = DATEPART(YYYY,GETDATE())) THEN ''
+      ELSE  AssessResultsResult 
+      END,
+
+
+			AssessResultsResultDate,
+			AssessResultsTopicComment, AssessResultsClassification, AssessResultClassificationDescription,
+			AssessCommentsCommentType, AssessCommentsStaffID, StudentForm, StudentTutor, 
+			StudentHouse, StudentBoardingHouse, 
+			CASE WHEN @RepComFlag = 0 
+					THEN r.AssessmentComment 
+				WHEN (@RepComFlag = 1 AND r.FileYear = YEAR(GETDATE())) 	
+					THEN ac.AssessmentComment 
+				ELSE r.AssessmentComment
+				END AS AssessmentComment, 
+			--r.AssessmentComment,
+			r.StaffID, AssessAreaResultTypeSynergyMeaning, SubjectComment, 
+			AssessResultGroupDescription, s.StaffID AS MentorID,
+			ResultValue = ISNULL(CASE
+							--WHEN AssessAreaHdgAbbrev2 IN ( 'Raw','Scaled' ) OR ( AssessAreaResultType IN ( 'OGRaw', 'OGScaled') AND AssessAreaHdgAbbrev2 IN ('Mark','Grade')) THEN TRY_CONVERT(DECIMAL(10, 3), REPLACE(AssessResultsResult, '*','')) --Commented by m.kannangara on 09.03.2018 
+							WHEN AssessAreaHdgAbbrev2 IN ( 'Raw','Scaled', 'Raw %') OR ( AssessAreaResultType IN ( 'OGRaw', 'OGScaled') AND AssessAreaHdgAbbrev2 IN ('Mark','Grade')) THEN TRY_CONVERT(DECIMAL(10, 3), REPLACE(AssessResultsResult, '*','')) --Added by m.kannangara on 09.03.2018 to include additional AssessAreaHdgAbbrev2 in the validation
+							ELSE 0
+						  END,0),
+			Main_ts.TotalStudents AS TotalStudents,
+			Main_mmc.MaxResult,
+			Main_mmc.MinResult,
+			Main_nceakc.ResultExcellence, 
+			Main_nceakc.ResultMerit, 
+			Main_nceakc.ResultAchieved, 
+			Main_nceakc.ResultNotAchieved,
+			--r.DataVerificationFlag,
+			scrg.GroupClass,
+			CASE	WHEN AssessResultsResult = 'E(H)' THEN Main_nceakc.EH
+					WHEN AssessResultsResult = 'E(M)' THEN Main_nceakc.EM 
+					WHEN AssessResultsResult = 'E(L)' THEN Main_nceakc.EL
+					WHEN AssessResultsResult = 'M(H)' THEN Main_nceakc.MH
+					WHEN AssessResultsResult = 'M(M)' THEN Main_nceakc.MM
+					WHEN AssessResultsResult = 'M(L)' THEN Main_nceakc.ML 
+					WHEN AssessResultsResult = 'A(H)' THEN Main_nceakc.AH
+					WHEN AssessResultsResult = 'A(M)' THEN Main_nceakc.AM 
+					WHEN AssessResultsResult = 'A(L)' THEN Main_nceakc.AL
+					WHEN AssessResultsResult = 'N(H)' THEN Main_nceakc.NH 
+					WHEN AssessResultsResult = 'N(M)' THEN Main_nceakc.NM
+					WHEN AssessResultsResult = 'N(L)' THEN Main_nceakc.NL
+			END AS NCEAMark
+
+			,CASE WHEN swlaeg.StudentID IS NULL THEN 0 ELSE 1 END AS LowAEGrade
+			--,0 AS LowAEGrade
+			,CASE WHEN swlcieg.StudentID IS NULL THEN 0 ELSE 1 END AS LowCIEGrade
+			--,0 AS LowCIEGrade
+
+			,CASE WHEN sas.SeqNo IS NOT NULL THEN 'Assess ' + (CASE WHEN sas.SeqNo <= 9 THEN  '0' + CONVERT(VARCHAR(5),sas.SeqNo) ELSE CONVERT(VARCHAR(5),sas.SeqNo) END ) WHEN ses.SeqNo IS NOT NULL THEN 'Exam 0' + CONVERT(VARCHAR(5),ses.SeqNo) END AS AssessmentSeq
+			,r.AssessAreaSeq
+			,r.ClassDescription -- Added by m.kannangara on 21-Jan-2020 
+			,r.OriginalAssessResultsResult -- Added by m.kannangara on 10-Jul-2023 
+			
+	FROM	stage.Extract_Synergetic_vStudentReportsSemesterResults r LEFT OUTER JOIN stage.Extract_Synergetic_luTutor lt ON NULLIF(r.StudentTutor, '') = lt.Code
+																	  LEFT OUTER JOIN stage.Extract_Synergetic_vStaff s ON NULLIF(TutorName, '')  = s.SchoolStaffCode
+																	  LEFT OUTER JOIN
+																	  (
+																	   SELECT ts.FileType, ts.FileYear, ts.FileSemester, ts.ResultGroup, ts.GroupClass, scrg.ClassCode, ts.TotalStudents
+																	   FROM #tableTotalStudents ts INNER JOIN
+																			stage.Extract_Synergetic_SubjectClassResultGroups scrg ON
+																			ts.FileType = scrg.FileType AND ts.FileYear = scrg.FileYear AND ts.FileSemester = scrg.FileSemester AND 
+																			ts.ResultGroup =  scrg.ResultGroup AND ts.GroupClass =  scrg.GroupClass
+																		)Main_ts ON Main_ts.FileType = r.FileType AND Main_ts.FileYear = r.FileYear AND Main_ts.FileSemester = r.FileSemester AND 
+																	   Main_ts.ClassCode = r.ClassCode AND Main_ts.ResultGroup = r.AssessAreaResultGroup
+
+																	   LEFT OUTER JOIN
+																	   (
+																	   SELECT mmc.FileType, mmc.FileYear, mmc.FileSemester, mmc.ResultGroup, mmc.GroupClass, scrg.ClassCode, mmc.MaxResult, mmc.MinResult
+																	   FROM #tableMinMaxCount mmc INNER JOIN
+																			stage.Extract_Synergetic_SubjectClassResultGroups scrg ON
+																			mmc.FileType = scrg.FileType AND mmc.FileYear = scrg.FileYear AND mmc.FileSemester = scrg.FileSemester AND 
+																			mmc.ResultGroup =  scrg.ResultGroup AND mmc.GroupClass =  scrg.GroupClass
+																		)Main_mmc ON Main_mmc.FileType = r.FileType AND Main_mmc.FileYear = r.FileYear AND Main_mmc.FileSemester = r.FileSemester AND 
+																	   Main_mmc.ClassCode = r.ClassCode AND Main_mmc.ResultGroup = r.AssessAreaResultGroup
+
+																	   LEFT OUTER JOIN
+																	   (
+																	   SELECT	nceakc.FileType, nceakc.FileYear, nceakc.FileSemester, nceakc.ResultGroup, nceakc.GroupClass, scrg.ClassCode, nceakc.ResultExcellence, 
+																				nceakc.ResultMerit, nceakc.ResultAchieved, nceakc.ResultNotAchieved, nceakc.EH, nceakc.EM, nceakc.EL, nceakc.MH, nceakc.MM,nceakc.ML, 
+																				nceakc.AH, nceakc.AM, nceakc.AL, nceakc.NH, nceakc.NM, nceakc.NL
+																	   FROM #tableNCEAKeyCount nceakc INNER JOIN
+																			stage.Extract_Synergetic_SubjectClassResultGroups scrg ON
+																			nceakc.FileType = scrg.FileType AND nceakc.FileYear = scrg.FileYear AND nceakc.FileSemester = scrg.FileSemester AND 
+																			nceakc.ResultGroup =  scrg.ResultGroup AND nceakc.GroupClass =  scrg.GroupClass
+																		)Main_nceakc ON Main_nceakc.FileType = r.FileType AND Main_nceakc.FileYear = r.FileYear AND Main_nceakc.FileSemester = r.FileSemester AND 
+																	   Main_nceakc.ClassCode = r.ClassCode AND Main_nceakc.ResultGroup = r.AssessAreaResultGroup
+																	 
+																	 LEFT OUTER JOIN stage.Extract_Synergetic_SubjectClassResultGroups scrg ON r.ClassCode = scrg.ClassCode
+																																		AND r.FileYear = scrg.FileYear
+																																		and scrg.ResultGroup = r.AssessAreaResultGroup
+													
+
+																		LEFT OUTER JOIN #tableStudentsWith_AELowGrades swlaeg ON swlaeg.FileType = r.FileType AND swlaeg.FileYear = r.FileYear AND 
+																													swlaeg.FileSemester = r.FileSemester AND swlaeg.ResultGroup = r.AssessAreaResultGroup
+																													AND swlaeg.StudentID = r.ID
+
+																	LEFT OUTER JOIN #tableStudentsWith_CIELowGrades swlcieg ON swlcieg.FileType = r.FileType AND swlcieg.FileYear = r.FileYear AND 
+																													swlcieg.FileSemester = r.FileSemester AND swlcieg.ResultGroup = substring(r.AssessAreaResultGroup, 1,2) AND r.AssessAreaResultGroup NOT LIKE '%ORD.A&E'
+																													AND swlcieg.StudentID = r.ID
+
+																	LEFT OUTER JOIN #tableStudentAssessmentSeq sas ON sas.FileType = r.FileType AND sas.FileYear = r.FileYear AND 
+																													sas.FileSemester = r.FileSemester AND sas.ResultGroup = r.AssessAreaResultGroup
+																													AND sas.StudentID = r.ID AND sas.Classcode = r.ClassCode and sas.FileYear >= 2018
+	
+																	LEFT OUTER JOIN #tableStudentExamSeq ses ON ses.FileType = r.FileType AND ses.FileYear = r.FileYear AND 
+																													ses.FileSemester = r.FileSemester AND ses.ResultGroup = r.AssessAreaResultGroup
+																													AND ses.StudentID = r.ID AND ses.Classcode = r.ClassCode and ses.FileYear >= 2018
+
+																	LEFT OUTER JOIN #AssessmentComment ac ON r.FileYear = ac.FileYear AND
+																											 r.FileSemester = ac.FileSemester AND
+																											 r.StudentID = ac.StudentID AND
+																											 r.Classcode = ac.Classcode 
+
+
+	WHERE	--AssessableFlag = 1 AND -- Commented by m.kannangara on 04-July-2018 to include all classes with assessments/marks  
+			--( AssessResultsResultDate IS NOT NULL OR AssessmentCode IN ( 'HOUSE','TUTOR', 'HM','FORM') ) -- Commented by m.kannangara on 09-July-2018 
+			( AssessResultsResultDate IS NOT NULL OR (AssessmentCode IN ( 'HOUSE','TUTOR', 'HM','FORM') AND  (AssessableFlag = 1 OR (ClassStopDate IS NULL OR ClassStartDate >= GETDATE())))) -- Added by m.kannangara on 09-July-2018 to include active (Assessible) tutor groups an house classes
+			AND ISNULL(AssessAreaResultType,'') NOT IN ( 'NCEASCE','NCEAAS','NCEAIntExam','NCEAUS') 
+		
+
+
+	UNION
+	SELECT  r.FileType, r.FileYear, r.FileSemester, r.ID AS StudentID, ClassColumn, r.ClassCampus, r.ClassCode,
+			AssessCommentsComment AS ClassComment, ClassLearningAreaCode, ClassLearningAreaDescription,
+			AssessmentCode, AssessHeading, AssessUnitName, AssessOverview, AssessAreaResultType,
+			AssessAreaResultTypeShortDesc, AssessAreaResultTypeSort, AssessAreaResultGroup,
+			AssessAreaResultGroupDescription, AssessAreaResultGroupLockedFlag, AssessAreaMarkOutOf,
+			AssessAreaWeightingFactor, AssessAreaMaskCode, AssessAreaHdgAbbrev1, AssessAreaHdgAbbrev2,
+			AssessAreaHeading, AssessAreaOverview, AssessAreaResultEntryFlag, AssessAreaResultPrintFlag,
+			AssessAreaDefaultClassification, AssessResultsResult, AssessResultsResultDate,
+			AssessResultsTopicComment, AssessResultsClassification, AssessResultClassificationDescription,
+			AssessCommentsCommentType, AssessCommentsStaffID, StudentForm, StudentTutor, 
+			StudentHouse, StudentBoardingHouse, AssessmentComment, r.StaffID, AssessAreaResultTypeSynergyMeaning, SubjectComment, 
+			AssessResultGroupDescription, s.StaffID AS MentorID,
+			ResultValue = CASE
+							--WHEN AssessAreaHdgAbbrev2 IN ( 'Raw','Scaled' ) OR ( AssessAreaResultType IN ( 'OGRaw', 'OGScaled') AND AssessAreaHdgAbbrev2 IN ('Mark','Grade')) THEN TRY_CONVERT(DECIMAL(10, 3), REPLACE(AssessResultsResult, '*','')) --Commented by m.kannangara on 09.03.2018 
+							WHEN AssessAreaHdgAbbrev2 IN ( 'Raw','Scaled', 'Raw %') OR ( AssessAreaResultType IN ( 'OGRaw', 'OGScaled') AND AssessAreaHdgAbbrev2 IN ('Mark','Grade')) THEN TRY_CONVERT(DECIMAL(10, 3), REPLACE(AssessResultsResult, '*','')) --Added by m.kannangara on 09.03.2018 to include additional AssessAreaHdgAbbrev2 in the validation
+							ELSE 0
+						  END,
+			Main_ts.TotalStudents AS TotalStudents,
+			Main_mmc.MaxResult,
+			Main_mmc.MinResult,
+			Main_nceakc.ResultExcellence, 
+			Main_nceakc.ResultMerit, 
+			Main_nceakc.ResultAchieved, 
+			Main_nceakc.ResultNotAchieved,
+			--0 AS DataVerificationFlag,
+			scrg.GroupClass,
+			--0 AS NCEAMark,
+			CASE	WHEN AssessResultsResult = 'E(H)' THEN Main_nceakc.EH
+					WHEN AssessResultsResult = 'E(M)' THEN Main_nceakc.EM 
+					WHEN AssessResultsResult = 'E(L)' THEN Main_nceakc.EL
+					WHEN AssessResultsResult = 'M(H)' THEN Main_nceakc.MH
+					WHEN AssessResultsResult = 'M(M)' THEN Main_nceakc.MM
+					WHEN AssessResultsResult = 'M(L)' THEN Main_nceakc.ML 
+					WHEN AssessResultsResult = 'A(H)' THEN Main_nceakc.AH
+					WHEN AssessResultsResult = 'A(M)' THEN Main_nceakc.AM 
+					WHEN AssessResultsResult = 'A(L)' THEN Main_nceakc.AL
+					WHEN AssessResultsResult = 'N(H)' THEN Main_nceakc.NH 
+					WHEN AssessResultsResult = 'N(M)' THEN Main_nceakc.NM
+					WHEN AssessResultsResult = 'N(L)' THEN Main_nceakc.NL
+			END AS NCEAMark,
+
+
+			--,0 AS LowerQuartile,
+			--0 AS Median,
+			--0 AS UpperQuartile
+
+			0 AS LowAEGrade, --Added by m.kannangara on 23-Aug-2018
+			0 AS LowCIEGrade, --Added by m.kannangara on 23-Aug-2018
+			CASE WHEN sas.SeqNo IS NOT NULL THEN 'Assess ' + CONVERT(VARCHAR(5),sas.SeqNo) WHEN ses.SeqNo IS NOT NULL THEN 'Exam ' + CONVERT(VARCHAR(5),ses.SeqNo) END AS AssessmentSeq, --Added by m.kannangara on 23-Aug-2018
+			r.AssessAreaSeq --Added by m.kannangara on 27-Sep-2018
+			,r.ClassDescription -- Added by m.kannangara on 21-Jan-2020 
+			,r.OriginalAssessResultsResult -- Added by m.kannangara on 10-Jul-2023 
+
+
+	FROM	stage.Extract_Synergetic_vPastStudentReportsSemesterResults r LEFT OUTER JOIN stage.Extract_Synergetic_luTutor lt ON NULLIF(r.StudentTutor, '') = lt.Code
+																	      LEFT OUTER JOIN stage.Extract_Synergetic_vStaff s ON NULLIF(TutorName, '')  = s.SchoolStaffCode
+																		    LEFT OUTER JOIN
+																		(
+																	   SELECT ts.FileType, ts.FileYear, ts.FileSemester, ts.ResultGroup, ts.GroupClass, scrg.ClassCode, ts.TotalStudents
+																	   FROM #tableTotalStudents ts INNER JOIN
+																			stage.Extract_Synergetic_SubjectClassResultGroups scrg ON
+																			ts.FileType = scrg.FileType AND ts.FileYear = scrg.FileYear AND ts.FileSemester = scrg.FileSemester AND 
+																			ts.ResultGroup =  scrg.ResultGroup AND ts.GroupClass =  scrg.GroupClass
+																		)Main_ts ON Main_ts.FileType = r.FileType AND Main_ts.FileYear = r.FileYear AND Main_ts.FileSemester = r.FileSemester AND 
+																	   Main_ts.ClassCode = r.ClassCode AND Main_ts.ResultGroup = r.AssessAreaResultGroup
+
+																	    LEFT OUTER JOIN
+																	   (
+																	   SELECT mmc.FileType, mmc.FileYear, mmc.FileSemester, mmc.ResultGroup, mmc.GroupClass, scrg.ClassCode, mmc.MaxResult, mmc.MinResult
+																	   FROM #tableMinMaxCount mmc INNER JOIN
+																			stage.Extract_Synergetic_SubjectClassResultGroups scrg ON
+																			mmc.FileType = scrg.FileType AND mmc.FileYear = scrg.FileYear AND mmc.FileSemester = scrg.FileSemester AND 
+																			mmc.ResultGroup =  scrg.ResultGroup AND mmc.GroupClass =  scrg.GroupClass
+																		)Main_mmc ON Main_mmc.FileType = r.FileType AND Main_mmc.FileYear = r.FileYear AND Main_mmc.FileSemester = r.FileSemester AND 
+																	   Main_mmc.ClassCode = r.ClassCode AND Main_mmc.ResultGroup = r.AssessAreaResultGroup
+
+																	   LEFT OUTER JOIN
+																	   (
+																	   SELECT	nceakc.FileType, nceakc.FileYear, nceakc.FileSemester, nceakc.ResultGroup, nceakc.GroupClass, scrg.ClassCode, nceakc.ResultExcellence, 
+																				nceakc.ResultMerit, nceakc.ResultAchieved, nceakc.ResultNotAchieved, nceakc.EH, nceakc.EM, nceakc.EL, nceakc.MH, nceakc.MM,nceakc.ML, 
+																				nceakc.AH, nceakc.AM, nceakc.AL, nceakc.NH, nceakc.NM, nceakc.NL
+																	   FROM #tableNCEAKeyCount nceakc INNER JOIN
+																			stage.Extract_Synergetic_SubjectClassResultGroups scrg ON
+																			nceakc.FileType = scrg.FileType AND nceakc.FileYear = scrg.FileYear AND nceakc.FileSemester = scrg.FileSemester AND 
+																			nceakc.ResultGroup =  scrg.ResultGroup AND nceakc.GroupClass =  scrg.GroupClass
+																		)Main_nceakc ON Main_nceakc.FileType = r.FileType AND Main_nceakc.FileYear = r.FileYear AND Main_nceakc.FileSemester = r.FileSemester AND 
+																	   Main_nceakc.ClassCode = r.ClassCode AND Main_nceakc.ResultGroup = r.AssessAreaResultGroup
+																	 
+																	   	
+																		LEFT OUTER JOIN stage.Extract_Synergetic_SubjectClassResultGroups scrg ON r.ClassCode = scrg.ClassCode
+																																		AND r.FileYear = scrg.FileYear
+																																		and scrg.ResultGroup = r.AssessAreaResultGroup
+
+																	   LEFT OUTER JOIN #tableStudentAssessmentSeq sas ON sas.FileType = r.FileType AND sas.FileYear = r.FileYear AND 
+																													sas.FileSemester = r.FileSemester AND sas.ResultGroup = r.AssessAreaResultGroup
+																													AND sas.StudentID = r.ID AND sas.Classcode = r.ClassCode and sas.FileYear >= 2018
+	
+ 																	   LEFT OUTER JOIN #tableStudentExamSeq ses ON ses.FileType = r.FileType AND ses.FileYear = r.FileYear AND 
+ 																													ses.FileSemester = r.FileSemester AND ses.ResultGroup = r.AssessAreaResultGroup
+																													AND ses.StudentID = r.ID AND ses.Classcode = r.ClassCode and ses.FileYear >= 2018
+																					
+
+	WHERE	--AssessableFlag = 1 AND -- Commented by m.kannangara on 04-July-2018 to include all classes with assessments/marks  
+			--( AssessResultsResultDate IS NOT NULL OR AssessmentCode IN ( 'HOUSE','TUTOR', 'HM','FORM') )  -- Commented by m.kannangara on 09-July-2018
+			( AssessResultsResultDate IS NOT NULL OR (AssessmentCode IN ( 'HOUSE','TUTOR', 'HM','FORM') AND  (AssessableFlag = 1 OR (ClassStopDate IS NULL OR ClassStartDate >= GETDATE())))) -- Added by m.kannangara on 09-July-2018 to include active (Assessible) tutor groups an house classes
+			AND ISNULL(AssessAreaResultType,'') NOT IN ( 'NCEASCE','NCEAAS','NCEAIntExam','NCEAUS') 
+
+
+	--		Infer Class Codes for dimClass
+
+	 INSERT INTO dds.dimClass ( ClassCode,  [Subject], NormalYearLevel, ClassSubject, Department, Pathway, QualificationType, CIESyllabusCode,
+								DETL_ProcessLogID, DETL_PackageLogID, DETL_DataFlowLogID, DETL_LoadDateTime, DETL_LastTouchedBY,
+								DETL_RowIsCurrent, DETL_RowChangeReason, DETL_ValidFromDateTime, DETL_Inferred, Overview)
+	
+
+	SELECT	DISTINCT sc.ClassCode, 'Unknown' AS 'Subject', 
+					ClassNormalYearLevel = CASE
+											 WHEN ISNUMERIC(REPLACE(LEFT(sc.ClassCode, 2),'.','') )  = 1 THEN REPLACE(LEFT(sc.ClassCode, 2),'.','') 
+											 ELSE -1
+											END , 
+					sc.ClassCode + ' (Unknown)' AS 'ClassSubject',
+					Department = CASE 
+										WHEN ( sc.ClassCode LIKE '12.ELI.AS_' OR sc.ClassCode LIKE '%.ENG.%' OR la.[Description] = 'English Language' ) AND sc.FileType = 'LEARN' THEN 'English'
+										WHEN ( sc.ClassCode LIKE '%.PHY.%' ) AND sc.FileType = 'LEARN'  THEN  'Physics'
+										WHEN ( sc.ClassCode LIKE '%.CHE.%' ) AND sc.FileType = 'LEARN'  THEN 'Chemistry'
+										WHEN ( sc.ClassCode LIKE '%.ACC.%' OR  sc.ClassCode LIKE '%.BUS.%' OR  sc.ClassCode LIKE '%.FIN_' OR la.[Description] = 'Business Studies') AND sc.FileType = 'LEARN' THEN  'Business Studies'
+										WHEN ( sc.ClassCode LIKE '%.ECO%.%' OR sc.ClassCode LIKE '%.ECO_' ) AND sc.FileType = 'LEARN' THEN  'Economics'
+										WHEN ( sc.ClassCode LIKE '%.SCI.%' OR la.[Description] = 'Science' ) AND sc.FileType = 'LEARN' THEN  'Science'
+										WHEN ( sc.ClassCode LIKE '%.MAT%.%' OR  sc.ClassCode LIKE '%.MAC.%' OR  sc.ClassCode LIKE '%.MAS.%' OR sc.ClassCode LIKE '%.MAT_' OR la.[Description] = 'Mathematics' ) AND sc.FileType = 'LEARN' THEN  'Mathematics'
+										WHEN ( sc.ClassCode LIKE '%.AEN.%' or sc.ClassCode LIKE '%.FDE.%' or sc.ClassCode LIKE '%.ICT.%' OR sc.ClassCode LIKE '%.PDE%.%' 
+												OR  sc.ClassCode LIKE '%.ADE_.%' OR sc.ClassCode LIKE '%.DEI.%' OR  sc.ClassCode LIKE '%.DTE.%' OR la.[Description] = 'Technology' ) AND sc.FileType = 'LEARN' THEN 'Technology'
+										WHEN ( sc.ClassCode LIKE '%.GEO.%' ) AND sc.FileType = 'LEARN'  THEN  'Geography'
+										WHEN sc.ClassCode LIKE '%.DRM.%' AND sc.FileType = 'LEARN'  THEN  'Drama'
+										WHEN sc.ClassCode = '10.CHI' OR sc.ClassCode LIKE '%.JAP' OR sc.ClassCode LIKE '%.LAT.%' OR sc.ClassCode LIKE '%.LAT_' OR sc.ClassCode LIKE '10.FRE_' OR sc.ClassCode LIKE '%.FRE.%' OR sc.ClassCode LIKE '%.FRE.%' OR sc.ClassCode LIKE '%.MAO.%' OR sc.ClassCode LIKE '%.SPN.%' AND sc.FileType = 'LEARN' THEN  'Languages'
+										WHEN ( sc.ClassCode LIKE '%.GRA.%' OR sc.ClassCode LIKE '%.DES.%' OR  sc.ClassCode LIKE '%.PAI.%' OR  sc.ClassCode LIKE '%.PHO.%' OR sc.ClassCode LIKE '%.GRA_'
+												OR sc.ClassCode LIKE '%.ART.%' OR  sc.ClassCode LIKE '%.ART[a-z]%' OR  sc.ClassCode LIKE '%(ART)%'  ) 
+	 											AND sc.FileType = 'LEARN' THEN  'Visual Art and Design'
+										WHEN ( sc.ClassCode LIKE '%.BIO.%' OR sc.ClassCode LIKE '%.BIO_.%'  OR sc.ClassCode = '13 BIO.N') AND sc.FileType = 'LEARN' THEN 'Biology'
+										WHEN sc.ClassCode LIKE '%.MES.%' AND sc.FileType = 'LEARN' THEN 'Media Studies'
+										WHEN ( sc.ClassCode LIKE '%.MUS.%' )  AND sc.FileType = 'LEARN' THEN 'Music'
+										WHEN ( sc.ClassCode LIKE '%.POS.%' OR sc.ClassCode LIKE '%.POSe%'  OR la.[Description] = 'Positive Education' ) AND sc.FileType = 'LEARN' THEN 'Positive Education' 
+										WHEN sc.ClassCode LIKE '%.PED%' AND sc.FileType = 'LEARN' THEN 'Physical Education'
+										WHEN sc.ClassCode LIKE '%.CLS.%'AND sc.FileType = 'LEARN' THEN 'Classical Studies'
+										WHEN ( sc.ClassCode LIKE '%.COM.%' OR sc.ClassCode LIKE '%.DLIT.%' OR la.[Description] = 'Computer Studies' ) AND sc.FileType = 'LEARN' THEN 'Computer Science'
+										WHEN ( sc.ClassCode LIKE '%.HIS.%' OR la.[Description] = 'History' ) AND sc.FileType = 'LEARN'  THEN 'History'
+										WHEN sc.ClassCode LIKE '%.ADE.%' AND sc.FileType = 'LEARN' THEN 'Architectural Design'
+										WHEN sc.ClassCode LIKE '%.HOA.%' AND sc.FileType = 'LEARN' THEN 'Art History'
+										WHEN ( sc.ClassCode LIKE '%.MUS.%' ) AND sc.FileType = 'LEARN' THEN 'Music'
+										WHEN ( sc.ClassCode LIKE '%.SOS.%' OR la.[Description] = 'Social Studies') AND sc.FileType = 'LEARN' THEN 'Social Studies'
+										WHEN ( sc.ClassCode LIKE '%.LSP%.%' OR sc.ClassCode LIKE '%.LSP_'  OR sc.ClassCode LIKE '%.LSP%' ) AND sc.FileType = 'LEARN' THEN 'Learning Support'
+										WHEN sc.ClassCode LIKE 'FORM_%' THEN 'Form Class'
+
+										ELSE 'Unknown'
+										 END, 
+						Pathway = CASE 
+									  WHEN CASE
+											WHEN CHARINDEX('.', sc.CLASSCODE) > 0 THEN TRY_CONVERT(INT, LEFT(sc.Classcode, (CHARINDEX('.', sc.Classcode)-1)))
+											ELSE 0
+										   END IN ( 9, 10 )  AND sc.FileType = 'LEARN' THEN 'Junior'
+									  WHEN sc.CLASSCODE LIKE '%.A2%' OR sc.CLASSCODE LIKE '%.AS%' THEN 'CIE'
+									  ELSE 'Other' 
+									END, 
+						QualificationType =  CASE WHEN sc.CLASSCODE LIKE '%.A2%' OR sc.CLASSCODE LIKE '%.AS%' THEN 'CIE'
+											WHEN CASE
+											WHEN CHARINDEX('.', sc.CLASSCODE) > 0 THEN TRY_CONVERT(INT, LEFT(sc.Classcode, (CHARINDEX('.', sc.Classcode)-1)))
+											ELSE 0
+										   END IN ( 9, 10 )  AND sc.FileType = 'LEARN' THEN 'Junior'
+											  ELSE 'Unknown'
+											 END,
+											
+						SyllabusCode AS CIESyllabusCode, 
+						@DETL_ProcessLogID, @DETL_PackageLogID, @DETL_DataFlowLogID, @DETL_LoadDateTime, @DETL_LastTouchedBY, 1, 'SCD1 New Insert', 19000101, 1, sc.AssessOverview 
+		FROM	stage.Transform_factStudentAssessment_School sc LEFT OUTER JOIN stage.Extract_Synergetic_LearningAreas la ON  la.LearningAreaCode = sc.ClassLearningAreaCode
+																															AND la.FileType = sc.FileType
+																LEFT OUTER JOIN stage.Extract_Synergetic_uSubjectClassesCIEAttributes cca ON sc.ClassCode = cca.ClassCode
+																																		AND sc.FileYear = cca.FileYear
+		WHERE	NOT EXISTS ( SELECT * FROM dds.dimClass cl
+							 WHERE sc.ClassCode = cl.ClassCode ) 
+
+		
+
+		SELECT @MaxFileYear = MAX(FileYear)
+		FROM	stage.Transform_factStudentAssessment_School
+
+
+		UPDATE dds.dimClass
+		SET  dds.dimClass.Overview = CASE WHEN ISNULL(dds.dimClass.Overview,'') <> ISNULL(sc.AssessOverview,'') THEN sc.AssessOverview ELSE dds.dimClass.Overview END
+		FROM stage.Transform_factStudentAssessment_School sc
+		WHERE dds.dimClass.ClassCode = sc.ClassCode AND sc.FileYear = @MaxFileYear
+
+
+	--		Map to dimensional Surrogate keys
+
+	UPDATE	tfssas
+	SET		DETL_StudentSurrogateKey = ISNULL(ds.DETL_StudentSurrogateKey, -1),
+			DETL_HouseSurrogateKey = ISNULL(dh.DETL_HouseSurrogateKey, -1),
+			DETL_BoardingHouseSurrogateKey = ISNULL(dhb.DETL_HouseSurrogateKey, -1),
+			DETL_GradeSurrogateKey = ISNULL(dg.DETL_GradeSurrogateKey, -1),
+			DETL_FileTermDateSurrogateKey = ISNULL(ft.DETL_FileTermDateSurrogateKey, -1 ),
+			DETL_MentorSurrogateKey = ISNULL(mentor.DETL_StaffSurrogateKey, -1 ),
+			DETL_ClassSurrogateKey = ISNULL(dc.DETL_ClassSurrogateKey, -1),
+			DETL_StaffSurrogateKey = ISNULL(dsst.DETL_StaffSurrogateKey, -1),
+			DETL_SchoolSurrogateKey = ISNULL(dsch.DETL_SchoolSurrogateKey, -1),
+			DETL_AssessmentTypeSurrogateKey = ISNULL(aty.DETL_AssessmentTypeSurrogateKey, -1),
+			DETL_AssessmentDateSurrogateKey = ISNULL(CONVERT(VARCHAR(40), AssessResultsResultDate, 112), -1),
+			DETL_QualificationSurrogateKey = ISNULL(dq.DETL_QualificationSurrogateKey, -1),
+			DETL_FileTypeSurrogateKey = ISNULL(NULLIF(dft.DETL_FileTypeSurrogateKey, -1), ISNULL(dft2.DETL_FileTypeSurrogateKey, -1)),
+			DETL_CommentSurrogateKey = ISNULL(com.DETL_CommentSurrogateKey, -1)
+
+					
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN dds.dimStudent ds ON tfssas.StudentID = ds.StudentID
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') >= ds.DETL_ValidFromDateTime 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') <= ISNULL(ds.DETL_ValidToDateTime,21000101)
+																LEFT OUTER JOIN dds.dimSchool dsch ON @CurrentSchoolCode = dsch.NCEASchoolCode
+
+																LEFT OUTER JOIN dds.dimHouse dh ON tfssas.House = dh.HouseCode
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') >= dh.DETL_ValidFromDateTime 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') <= ISNULL(dh.DETL_ValidToDateTime,21000101)
+																
+																LEFT OUTER JOIN dds.dimHouse dhb ON tfssas.BoardingHouse = dhb.HouseCode
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') >= dhb.DETL_ValidFromDateTime 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') <= ISNULL(dhb.DETL_ValidToDateTime,21000101)
+
+																LEFT OUTER JOIN dds.dimStaff mentor ON tfssas.MentorID = mentor.StaffID
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') >= mentor.DETL_ValidFromDateTime 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') <= ISNULL(mentor.DETL_ValidToDateTime,21000101)
+
+																LEFT OUTER JOIN dds.dimGrade dg ON tfssas.AssessResultsResult = dg.GradeCode 
+																								   AND CASE
+																										--		Order CIE Equivalent Grades logic
+																										WHEN tfssas.AssessAreaResultType = 'OGEquiv' AND tfssas.AssessAreaHdgAbbrev2 = 'CIE Eqv Gr' THEN 'CAM'
+																										ELSE tfssas.AssessAreaResultType 
+																										END = dg.GradeType
+																LEFT OUTER JOIN 
+																				(
+																					SELECT	[Year], Term, MIN(DETL_DateSurrogateKey) AS DETL_FileTermDateSurrogateKey, MIN(Date) AS FileTermDate 
+																					FROM	DDS.dimDate
+																					GROUP BY [Year], Term
+																				) ft ON tfssas.FileYear = ft.[Year]
+																						AND tfssas.FileSemester = ft.Term
+
+			 													LEFT OUTER JOIN DDS.dimComment com on 
+																									CONVERT(VARCHAR(MAX), tfssas.AssessmentComment) =  CONVERT(VARCHAR(MAX), com.Comment)
+																									--tfssas.AssessmentComment = com.Comment 
+																									AND com.CommentCategory = 'Assessment' --Commented by m.kannangara on 06-April-2018 to include turor and house master comments 
+																									AND com.CommentType  = tfssas.AssessHeading
+																									--AND tfssas.DataVerificationFlag = 1
+				
+															  LEFT OUTER JOIN DDS.dimStaff dsst ON tfssas.StaffID = dsst.StaffID 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') >= dsst.DETL_ValidFromDateTime 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') <= ISNULL(dsst.DETL_ValidToDateTime,21000101)
+
+															  LEFT OUTER JOIN DDS.dimClass dc ON tfssas.ClassCode = dc.ClassCode
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') >= dc.DETL_ValidFromDateTime 
+																								  AND REPLACE(CONVERT(DATE,tfssas.AssessResultsResultDate),'-','') <= ISNULL(dc.DETL_ValidToDateTime,21000101)
+								   
+
+															  LEFT OUTER JOIN DDS.dimQualification dq ON CASE
+																											WHEN dc.QualificationType = 'NCEA Level 1' THEN 'NCEAL1'
+																											WHEN dc.QualificationType = 'NCEA Level 2' THEN 'NCEAL2'
+																											WHEN dc.QualificationType = 'NCEA Level 3' THEN 'NCEAL3'
+																											WHEN dc.QualificationType = 'AS Level' THEN 'AS'
+																											WHEN dc.QualificationType = 'A Level' THEN 'A2'
+																											ELSE dc.QualificationType
+																										  END  = dq.QualificationName AND
+																										  CASE WHEN dc.ClassCode LIKE '%LAT.AP%' THEN 'AP' ELSE dc.Pathway  
+																										  END = dq.QualificationCategoryName
+
+															  LEFT OUTER JOIN DDS.dimAssessmentType aty ON	CASE
+																											  WHEN tfssas.assessmentcode IN ( 'T_HOUSE','HM','TUTOR','HOUSE') THEN AssessHeading
+																											  ELSE AssessAreaHeading
+																											END = aty.AssessmentTypeName
+																											AND CASE
+																												  WHEN tfssas.assessmentcode IN ( 'T_HOUSE','HM','TUTOR','HOUSE') THEN 'House/Head Master Comment'
+																												  ELSE AssessAreaResultGroupDescription
+																												END = aty.AssessmentCategoryName AND  
+																												tfssas.AssessAreaHeading = aty.AssessmentTypeName AND 
+																												tfssas.AssessAreaHdgAbbrev1 = aty.AssessmentAbbrev1 AND
+																												tfssas.AssessAreaHdgAbbrev2 = aty.AssessmentAbbrev2 
+																											AND aty.AssessmentSubCategoryName = 'School Assessment'		
+															  LEFT OUTER JOIN DDS.dimFileType dft ON tfssas.FileType =	dft.LegacyFileTypeCode
+															  LEFT OUTER JOIN DDS.dimFileType dft2 ON tfssas.FileType =	dft2.FileTypeCode
+															  								
+
+	--		Remap NULL Student keys to earliest available StudentID within dimStudent
+	--		Related to Classes completed over Semester 5
+	--		Use Term Semester for match
+	
+	UPDATE	tfssas
+	SET		DETL_StudentSurrogateKey = ISNULL(ds.DETL_StudentSurrogateKey, -1) 
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN DDS.dimStudent ds ON tfssas.StudentId = ds.StudentID 
+																								    AND DETL_FileTermDateSurrogateKey >= ds.DETL_ValidFromDateTime 
+																								    AND DETL_FileTermDateSurrogateKey <= ISNULL(ds.DETL_ValidToDateTime,21000101)
+	
+
+	WHERE	NULLIF(tfssas.DETL_StudentSurrogateKey, -1) IS NULL
+
+	--		Use File Year for match
+
+
+	UPDATE	tfssas
+	SET		DETL_StudentSurrogateKey = ISNULL(ds.DETL_StudentSurrogateKey, -1) 
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN DDS.dimStudent ds ON tfssas.StudentId = ds.StudentID 
+																								    AND tfssas.FileYear >= ds.FileYear
+	
+
+	WHERE	NULLIF(tfssas.DETL_StudentSurrogateKey, -1) IS NULL
+
+
+	--		Missing Result Date affects house and boarding house
+
+	UPDATE	tfssas
+	SET		DETL_HouseSurrogateKey = COALESCE(NULLIF(tfssas.DETL_HouseSurrogateKey, -1), dh.DETL_HouseSurrogateKey, -1), DETL_BoardingHouseSurrogateKey = COALESCE (NULLIF(tfssas.DETL_BoardingHouseSurrogateKey, -1), dhb.DETL_HouseSurrogateKey, -1)
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN dds.dimHouse dh ON tfssas.House = dh.HouseCode
+																LEFT OUTER JOIN dds.dimHouse dhb ON tfssas.BoardingHouse = dhb.HouseCode
+	WHERE	( ISNULL(tfssas.DETL_HouseSurrogateKey, -1) = -1 OR ISNULL(tfssas.DETL_BoardingHouseSurrogateKey, -1) = -1 ) 
+
+	--		Missing Result Date affects mentor and staff
+
+	UPDATE	tfssas
+	SET		DETL_StaffSurrogateKey = COALESCE(NULLIF(tfssas.DETL_StaffSurrogateKey, -1), st.DETL_StaffSurrogateKey, -1), DETL_MentorSurrogateKey = COALESCE (NULLIF(tfssas.DETL_MentorSurrogateKey, -1), mentor.DETL_StaffSurrogateKey, -1)
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN dds.dimStaff mentor ON tfssas.MentorID = mentor.StaffID
+																										AND mentor.DETL_RowIsCurrent = 1
+																LEFT OUTER JOIN dds.dimStaff st ON tfssas.StaffID = st.StaffID
+																								   AND st.DETL_RowIsCurrent = 1
+																		
+	WHERE	( ISNULL(tfssas.DETL_StaffSurrogateKey, -1)  = -1 OR ISNULL(tfssas.DETL_MentorSurrogateKey, -1) = -1 ) 
+
+		--		Match first occurance by Term Date
+
+	UPDATE	tfssas
+	SET		DETL_HouseSurrogateKey = COALESCE(NULLIF(tfssas.DETL_HouseSurrogateKey, -1), x.DETL_HouseSurrogateKey, -1), DETL_BoardingHouseSurrogateKey = COALESCE (NULLIF(tfssas.DETL_BoardingHouseSurrogateKey, -1), x.DETL_HouseSurrogateKey, -1)
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN (	SELECT	StudentID, DETL_FileTermDateSurrogateKey, MIN(DETL_HouseSurrogateKey) AS DETL_HouseSurrogateKey, MIN(DETL_MentorSurrogateKey) AS DETL_MentorSurrogateKey,
+																							MIN(DETL_BoardingHouseSurrogateKey) AS DETL_BoardingHouseSurrogateKey
+																					FROM	stage.Transform_factStudentClass
+																					GROUP	BY StudentID, DETL_FileTermDateSurrogateKey  ) x ON tfssas.StudentID = x.StudentID
+																																			AND tfssas.DETL_FileTermDateSurrogateKey = x.DETL_FileTermDateSurrogateKey
+	WHERE	( ISNULL(tfssas.DETL_HouseSurrogateKey, -1) = -1 OR ISNULL(tfssas.DETL_BoardingHouseSurrogateKey, -1) = -1 ) 
+						
+	--		Match first occurance period
+
+	UPDATE	tfssas
+	SET		DETL_HouseSurrogateKey = COALESCE(NULLIF(tfssas.DETL_HouseSurrogateKey, -1), x.DETL_HouseSurrogateKey, -1), DETL_BoardingHouseSurrogateKey = COALESCE (NULLIF(tfssas.DETL_BoardingHouseSurrogateKey, -1), x.DETL_HouseSurrogateKey, -1)
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN (	SELECT	StudentID, MIN(DETL_HouseSurrogateKey) AS DETL_HouseSurrogateKey, MIN(DETL_MentorSurrogateKey) AS DETL_MentorSurrogateKey,
+																							MIN(DETL_BoardingHouseSurrogateKey) AS DETL_BoardingHouseSurrogateKey
+																					FROM	stage.Transform_factStudentClass
+																					GROUP	BY StudentID ) x ON tfssas.StudentID = x.StudentID
+																											
+	WHERE	( ISNULL(tfssas.DETL_HouseSurrogateKey, -1) = -1 OR ISNULL(tfssas.DETL_BoardingHouseSurrogateKey,-1) = -1 ) 
+
+
+	--		ReMap NULL grade for CIE term orders
+	--		CIE term orders are estimates rather than an actual grade 
+		
+	UPDATE	tfssas
+	SET		DETL_GradeSurrogateKey = ISNULL(dg.DETL_GradeSurrogateKey, -1) 
+	FROM	stage.Transform_factStudentAssessment_School tfssas	INNER JOIN (	SELECT	FileType, FileYear, FileSemester, ClassCampus, ClassCode, uscc.Qualification, ulu.SyllabusCode, SyllabusTitle, uscc.OptionCode, Grade, MarkLower, MarkUpper
+																				FROM		stage.extract_Synergetic_uSubjectClassesCIEAttributes uscc INNER JOIN stage.extract_Synergetic_uluCIEGradeEstimate ulu ON ulu.Qualification = uscc.Qualification 
+																																																						  AND ulu.SyllabusCode = uscc.SyllabusCode 
+																																																						  AND ulu.OPtionCode = uscc.OptionCode
+																					 ) x ON tfssas.fileyear = x.fileyear
+																							AND tfssas.ClassCode = x.ClassCode
+																							AND  CONVERT(INT, TRY_CONVERT(DECIMAL,REPLACE(tfssas.AssessResultsResult,'*',''))) >= x.MarkLower
+																							AND  CONVERT(INT, TRY_CONVERT(DECIMAL,REPLACE(tfssas.AssessResultsResult,'*',''))) <= x.MarkUpper
+																							AND tfssas.filetype = x.filetype
+																 INNER JOIN stage.Transform_dimClass tdc ON tfssas.ClassCode = tdc.ClassCode
+																											AND tdc.Pathway = 'CIE'
+																 INNER JOIN dds.dimGrade dg ON x.Grade = dg.GradeCode
+																							   AND dg.GradeType = 'CAM'
+
+	WHERE	ISNULL(tfssas.DETL_GradeSurrogateKey, -1)  = -1
+											  
+
+	--		Map NULL Classes
+
+	UPDATE	tfssas
+	SET		DETL_ClassSurrogateKey = ISNULL(dc.DETL_ClassSurrogateKey, -1)
+	FROM	stage.Transform_factStudentAssessment_School tfssas LEFT OUTER JOIN DDS.dimClass dc ON tfssas.ClassCode = dc.ClassCode
+	WHERE	NULLIF(tfssas.DETL_ClassSurrogateKey, -1) IS NULL
+
+
+	DROP TABLE #tableNCEAKey
+	DROP TABLE #tableNCEAKeyCount													
+	DROP TABLE #tableNCEAGrades	
+	DROP TABLE #tableMinMaxCount
+	DROP TABLE #tableMinMaxCount_Temp
+	DROP TABLE #tableTotalStudents
+	DROP TABLE #tableStudentsWith_AELowGrades
+	DROP TABLE #tableStudentsWith_CIELowGrades
+	DROP TABLE #tableStudentAssessmentSeq
+	DROP TABLE #tableStudentExamSeq  													
+						
+  END TRY
+
+  BEGIN CATCH
+
+
+	--		Raise error message
+
+	SET  @ErrorMsg  = ERROR_MESSAGE();
+
+	THROW 51000, @ErrorMsg, 1;
+
+  END CATCH
+
+
+											
+
+
+
+
+
